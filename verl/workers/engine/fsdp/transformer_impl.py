@@ -950,10 +950,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             # only pass input_ids and position_ids to enable flash_attn_varlen
 
+            # Calculate cu_seq_lens and max_seq_len for flash_attn_varlen
+            cu_seq_lens = input_ids.offsets().to(torch.int32)
+            max_seq_len = input_ids.offsets().diff().max().item()
+
             model_inputs = {
                 "input_ids": input_ids_rmpad,
                 "attention_mask": None,
                 "position_ids": position_ids_rmpad,
+                "cu_seq_lens_q": cu_seq_lens,
+                "cu_seq_lens_k": cu_seq_lens,
+                "max_length_q": max_seq_len,
+                "max_length_k": max_seq_len,
             }
 
         else:
