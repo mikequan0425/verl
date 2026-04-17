@@ -354,3 +354,58 @@ modeling_qwen3_5_moe.Qwen3_5MoeExperts.forward = qwen3_5_moe_experts_forward_npu
 modeling_qwen3_5_moe.Qwen3_5MoeRMSNormGated.forward = qwen3_next_rms_norm_forward_gated_npu
 modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm.forward = qwen3_next_rms_norm_forward_npu
 modeling_qwen3_5_moe.apply_rotary_pos_emb = qwen3_next_apply_rotary_pos_emb_npu
+
+# Patch for Qwen3.5 MoE GDN (Gated Delta Network) to support variable-length sequences on NPU
+from verl.models.transformers.chunk_gated_delta_rule import chunk_gated_delta_rule
+
+modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet.chunk_gated_delta_rule = chunk_gated_delta_rule
+
+
+# Patch for Qwen3.5 MoE DecoderLayer to pass cu_seq_lens to GDN
+def _qwen3_5_moe_decoder_layer_forward_with_cu_seq_lens(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    **kwargs,
+):
+    """
+    DecoderLayer forward that extracts cu_seq_lens from kwargs and passes it to linear attention (GDN).
+    Compatible with transformers >= 4.57.0 where cache_position parameter was removed.
+    """
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+
+    if self.layer_type == "linear_attention":
+        cu_seq_lens = kwargs.get("cu_seq_lens_q", None)
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+            cu_seq_lens=cu_seq_lens,
+        )
+    elif self.layer_type == "full_attention":
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    if isinstance(hidden_states, tuple):
+        hidden_states, _ = hidden_states
+    hidden_states = residual + hidden_states
+
+    return hidden_states
+
+
+modeling_qwen3_5_moe.Qwen3_5MoeDecoderLayer.forward = _qwen3_5_moe_decoder_layer_forward_with_cu_seq_lens
