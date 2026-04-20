@@ -18,7 +18,7 @@ import pytest
 
 from verl.utils.flops_counter import FlopsCounter
 
-VALID_CONFIG_TYPE = {"llama", "qwen2", "qwen3", "qwen3_moe", "deepseek_v3", "mistral", "gemma3_text", "apertus"}
+VALID_CONFIG_TYPE = {"llama", "qwen2", "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe", "deepseek_v3", "mistral", "gemma3_text", "apertus"}
 
 
 class Config:

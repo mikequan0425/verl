@@ -534,6 +534,140 @@ def _estimate_gpt_oss_flops(config, tokens_sum, batch_seqlens, delta_time):
     return flops_achieved
 
 
+def _estimate_qwen3_5_flops(config, tokens_sum, batch_seqlens, delta_time):
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    num_hidden_layers = config.num_hidden_layers
+    num_key_value_heads = config.num_key_value_heads
+    num_attention_heads = config.num_attention_heads
+    intermediate_size = config.intermediate_size
+
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+    q_size = num_attention_heads * head_dim * 2  # Qwen3.5 q_proj outputs 2x for gate
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    mlp_N = hidden_size * intermediate_size * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    dense_N_flops = 6 * dense_N * tokens_sum
+
+    layer_types = getattr(config, "layer_types", None)
+    sliding_window = getattr(config, "sliding_window", None)
+
+    full_attn_seqlen_square_sum = 0
+    linear_attn_seqlen_sum = 0
+
+    if layer_types:
+        for layer_idx in range(num_hidden_layers):
+            is_full_attn = layer_types[layer_idx] == "full_attention"
+
+            for seqlen in batch_seqlens:
+                if is_full_attn:
+                    effective_seqlen = seqlen
+                    if sliding_window is not None:
+                        effective_seqlen = min(seqlen, sliding_window)
+                    full_attn_seqlen_square_sum += effective_seqlen * effective_seqlen
+                else:
+                    linear_attn_seqlen_sum += seqlen
+    else:
+        for seqlen in batch_seqlens:
+            seqlen_square = seqlen * seqlen
+            if sliding_window is not None:
+                effective_seqlen = min(seqlen, sliding_window)
+                seqlen_square = seqlen * effective_seqlen
+            full_attn_seqlen_square_sum += seqlen_square
+        full_attn_seqlen_square_sum *= num_hidden_layers
+
+    attn_qkv_flops = 6 * full_attn_seqlen_square_sum * head_dim * num_attention_heads
+
+    linear_head_k_dim = getattr(config, "linear_key_head_dim", None)
+    linear_head_v_dim = getattr(config, "linear_value_head_dim", None)
+    linear_num_v_heads = getattr(config, "linear_num_value_heads", None)
+
+    if linear_attn_seqlen_sum > 0 and linear_head_k_dim is not None and linear_head_v_dim is not None:
+        if linear_num_v_heads is None:
+            linear_num_v_heads = num_attention_heads
+        linear_attn_flops = 6 * linear_attn_seqlen_sum * linear_head_k_dim * linear_head_v_dim * linear_num_v_heads
+        attn_qkv_flops += linear_attn_flops
+
+    flops_all_token = dense_N_flops + attn_qkv_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
+def _estimate_qwen3_5_moe_flops(config, tokens_sum, batch_seqlens, delta_time):
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    num_hidden_layers = config.num_hidden_layers
+    num_key_value_heads = config.num_key_value_heads
+    num_attention_heads = config.num_attention_heads
+
+    moe_intermediate_size = config.moe_intermediate_size
+    moe_topk = config.num_experts_per_tok
+    moe_num_expert = config.num_experts
+    shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", moe_intermediate_size)
+
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+    q_size = num_attention_heads * head_dim * 2
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    moe_gate_N = hidden_size * moe_num_expert
+    moe_expertmlp_N = hidden_size * moe_intermediate_size * moe_topk * 3
+    shared_expert_N = hidden_size * shared_expert_intermediate_size * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    moe_N = (moe_gate_N + moe_expertmlp_N + shared_expert_N + attn_linear_N) * (num_hidden_layers) + emd_and_lm_head_N
+    dense_N_flops = 6 * moe_N * tokens_sum
+
+    layer_types = getattr(config, "layer_types", None)
+    sliding_window = getattr(config, "sliding_window", None)
+
+    full_attn_seqlen_square_sum = 0
+    linear_attn_seqlen_sum = 0
+
+    if layer_types:
+        for layer_idx in range(num_hidden_layers):
+            is_full_attn = layer_types[layer_idx] == "full_attention"
+
+            for seqlen in batch_seqlens:
+                if is_full_attn:
+                    effective_seqlen = seqlen
+                    if sliding_window is not None:
+                        effective_seqlen = min(seqlen, sliding_window)
+                    full_attn_seqlen_square_sum += effective_seqlen * effective_seqlen
+                else:
+                    linear_attn_seqlen_sum += seqlen
+    else:
+        for seqlen in batch_seqlens:
+            seqlen_square = seqlen * seqlen
+            if sliding_window is not None:
+                effective_seqlen = min(seqlen, sliding_window)
+                seqlen_square = seqlen * effective_seqlen
+            full_attn_seqlen_square_sum += seqlen_square
+        full_attn_seqlen_square_sum *= num_hidden_layers
+
+    attn_qkv_flops = 6 * full_attn_seqlen_square_sum * head_dim * num_attention_heads
+
+    linear_head_k_dim = getattr(config, "linear_key_head_dim", None)
+    linear_head_v_dim = getattr(config, "linear_value_head_dim", None)
+    linear_num_v_heads = getattr(config, "linear_num_value_heads", None)
+
+    if linear_attn_seqlen_sum > 0 and linear_head_k_dim is not None and linear_head_v_dim is not None:
+        if linear_num_v_heads is None:
+            linear_num_v_heads = num_attention_heads
+        linear_attn_flops = 6 * linear_attn_seqlen_sum * linear_head_k_dim * linear_head_v_dim * linear_num_v_heads
+        attn_qkv_flops += linear_attn_flops
+
+    flops_all_token = dense_N_flops + attn_qkv_flops
+    flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+    return flops_achieved
+
+
 def _estimate_unknown_flops(config, tokens_sum, batch_seqlens, delta_time):
     return 0
 
@@ -548,6 +682,8 @@ ESTIMATE_FUNC = {
     "qwen3_moe": _estimate_qwen2_moe_flops,
     "qwen3_vl": _estimate_qwen3_vl_flops,
     "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
+    "qwen3_5": _estimate_qwen3_5_flops,
+    "qwen3_5_moe": _estimate_qwen3_5_moe_flops,
     "deepseek_v3": _estimate_deepseek_v3_flops,
     "minicpmv": _estimate_qwen2_flops,
     "minicpmo": _estimate_qwen2_flops,
