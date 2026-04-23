@@ -146,7 +146,8 @@ def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
+    # router_logits = self.gate(hidden_states)
+    router_logits = RouterGatingLinearFunction.apply(hidden_states, self.gate.weight, torch.float32)
 
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -198,6 +199,47 @@ def qwen3_next_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -
     return final_hidden_states, router_logits
 
 
+def qwen3_5_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """NPU optimized implementation for `forward` in Qwen3_5MoeSparseMoeBlock."""
+    output_shape = hidden_states.shape
+    hidden_dim = hidden_states.shape[-1]
+    hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+    # 1. Router forward
+    router_logits = RouterGatingLinearFunction.apply(hidden_states_reshaped, self.gate.weight, torch.float32)
+    routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, self.gate.top_k, dim=-1)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    routing_weights = routing_weights.to(hidden_states_reshaped.dtype)
+
+    # 2. Experts forward
+    gate_up_proj = self.experts.gate_up_proj.permute(0, 2, 1).contiguous()
+    down_proj = self.experts.down_proj.permute(0, 2, 1).contiguous()
+
+    permuted_hidden_states, row_ids_map = torch_npu.npu_moe_token_permute(
+        hidden_states_reshaped, selected_experts.to(torch.int32)
+    )
+    tokens_per_expert = torch.histc(selected_experts, bins=self.gate.num_experts, min=0, max=self.gate.num_experts)
+
+    intermediate_hidden_states = NPUGmmFunction.apply(permuted_hidden_states, gate_up_proj, tokens_per_expert)
+    intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
+    output = NPUGmmFunction.apply(intermediate_activations, down_proj, tokens_per_expert)
+    expert_output = torch_npu.npu_moe_token_unpermute(output.to(routing_weights.dtype), row_ids_map,
+                                                      probs=routing_weights)
+
+    # 3. Shared expert forward
+    shared_expert_output = self.shared_expert(hidden_states_reshaped)
+    shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
+
+    # 4. Add up
+    final_hidden_states = expert_output + shared_expert_output
+    final_hidden_states = final_hidden_states.reshape(output_shape)
+
+    # print("DEBUG here is fp32 test!!!!")
+
+    return final_hidden_states, router_logits
+
+
 class NPUQwen3VLMoeTextExperts(nn.Module):
     """NPU optimized implementation for Qwen3VLMoeTextExperts."""
 
@@ -212,7 +254,7 @@ class NPUQwen3VLMoeTextExperts(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(
-        self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor
+            self, hidden_states: torch.Tensor, routing_weights: torch.Tensor, router_indices: torch.Tensor
     ) -> torch.Tensor:
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
@@ -255,7 +297,7 @@ class NPUQwen3VLMoeTextExperts(nn.Module):
             next_states = torch.bmm((up * self.act_fn(gate)), self.down_proj)
             next_states = next_states.reshape(self.num_experts, batch_size, -1, self.hidden_size)
             next_states = (
-                next_states * routing_weights.transpose(0, 1).view(self.num_experts, batch_size, -1)[..., None]
+                    next_states * routing_weights.transpose(0, 1).view(self.num_experts, batch_size, -1)[..., None]
             )
             next_states = next_states.sum(dim=0)
         return next_states
@@ -275,7 +317,8 @@ class NPUQwen3VLMoeTextSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        router_logits = self.gate(hidden_states)
+        # router_logits = self.gate(hidden_states)
+        router_logits = RouterGatingLinearFunction.apply(hidden_states, self.gate.weight, torch.float32)
         routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
         routing_weights, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
@@ -304,10 +347,70 @@ def qwen3_5_moe_experts_forward_npu(
     intermediate_hidden_states = NPUGmmFunction.apply(permuted_hidden_states, gate_up_proj, tokens_per_expert)
     intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
     output = NPUGmmFunction.apply(intermediate_activations, down_proj, tokens_per_expert)
-    final_hidden_states = torch_npu.npu_moe_token_unpermute(
-        output.to(routing_weights.dtype), row_ids_map, probs=routing_weights
-    )
-    return final_hidden_states.to(hidden_states.dtype)
+    final_hidden_states = torch_npu.npu_moe_token_unpermute(output.to(routing_weights.dtype), row_ids_map,
+                                                            probs=routing_weights)
+    return final_hidden_states
+
+
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """
+    Copied from Megatron-LM megatron/core/transformer/moe/moe_utils.py
+    Autograd function for router gating linear.
+    """
+
+    @staticmethod
+    def forward(
+            ctx,
+            inp: torch.Tensor,
+            weight: torch.Tensor,
+            router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Forward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            inp (torch.Tensor): The input tensor.
+            weight (torch.Tensor): The weight tensor.
+            router_dtype (torch.dtype): The router dtype.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
+        ctx.save_for_backward(inp, weight)
+        ctx.router_dtype = router_dtype
+        ctx.input_dtype = inp.dtype
+        ctx.weight_dtype = weight.dtype
+        inp_shape = inp.shape
+        inp = inp.view(-1, inp_shape[-1])
+
+        output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+
+        output = output.view(*inp_shape[:-1], -1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """
+        Backward pass of the RouterGatingLinearFunction function.
+
+        Args:
+            grad_output (torch.Tensor): The gradient output.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+                The gradient input, gradient weight, gradient bias, and None.
+        """
+        inp, weight = ctx.saved_tensors
+        inp_shape = inp.shape
+        grad_shape = grad_output.shape
+        inp = inp.view(-1, inp_shape[-1])
+        grad_output = grad_output.view(-1, grad_shape[-1])
+
+        grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+        grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+
+        grad_input = grad_input.view(*inp_shape)
+        return grad_input, grad_weight, None
 
 
 # Patches for Qwen2 Model
@@ -316,7 +419,7 @@ modeling_qwen2.Qwen2MLP.forward = silu_forward_npu
 modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 
 # Patches for Qwen2.5-VL Model
-modeling_qwen2_5_vl.Qwen2RMSNorm.forward = rms_norm_forward_npu
+# modeling_qwen2_5_vl.Qwen2RMSNorm.forward = rms_norm_forward_npu
 modeling_qwen2_5_vl.Qwen2_5_VLMLP.forward = silu_forward_npu
 
 # Patches for Qwen3 Model
@@ -350,7 +453,8 @@ modeling_qwen3_5.Qwen3_5RMSNorm.forward = qwen3_next_rms_norm_forward_npu
 modeling_qwen3_5.apply_rotary_pos_emb = qwen3_next_apply_rotary_pos_emb_npu
 
 # Patches for Qwen3.5 MoE Model
-modeling_qwen3_5_moe.Qwen3_5MoeExperts.forward = qwen3_5_moe_experts_forward_npu
+# modeling_qwen3_5_moe.Qwen3_5MoeExperts.forward = qwen3_5_moe_experts_forward_npu
+modeling_qwen3_5_moe.Qwen3_5MoeSparseMoeBlock.forward = qwen3_5_sparse_moe_block_forward_npu
 modeling_qwen3_5_moe.Qwen3_5MoeRMSNormGated.forward = qwen3_next_rms_norm_forward_gated_npu
 modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm.forward = qwen3_next_rms_norm_forward_npu
 modeling_qwen3_5_moe.apply_rotary_pos_emb = qwen3_next_apply_rotary_pos_emb_npu
