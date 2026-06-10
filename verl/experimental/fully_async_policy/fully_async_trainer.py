@@ -276,7 +276,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if rollout_total_steps is None:
             return None
 
-        required_samples = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.async_training.require_batches
+        required_samples = (
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.async_training.require_batches
+        )
         steps_per_sync = required_samples * self.config.async_training.trigger_parameter_sync_step
         return int(rollout_total_steps / steps_per_sync)
 
@@ -383,7 +385,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         total_training_steps = self._resolve_total_training_steps_before_init()
         if total_training_steps is not None:
             self._set_total_training_steps_in_config(total_training_steps)
-            
+
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
