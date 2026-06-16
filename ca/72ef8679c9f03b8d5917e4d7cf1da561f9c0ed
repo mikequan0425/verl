@@ -1,0 +1,48 @@
+verl/experimental/fully_async_policy/fully_async_trainer.py
+  h_00d3a946329f2f 256
+verl/experimental/fully_async_policy/fully_async_main.py
+  h_00d3a946329f2f 23,77,97,133-135,137,139,147-151,153
+  s_7ac9c357fe09fd::t_dac90db6d7b425 80
+  s_27853c049f36d1::t_8c7cdc79e06005 122
+verl/experimental/fully_async_policy/fully_async_rollouter.py
+  s_90e5790d3270e3::t_a35f99453b0e15 567
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ca72ef8679c9f03b8d5917e4d7cf1da561f9c0ed",
+  "prompts": {},
+  "humans": {
+    "h_00d3a946329f2f": {
+      "author": "mikeq <mikequan0425@foxmail.com>"
+    }
+  },
+  "sessions": {
+    "s_27853c049f36d1": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-37c4405f-8059-4b09-a851-1b6d0b95429a",
+        "model": "default"
+      },
+      "human_author": "mikeq <mikequan0425@foxmail.com>"
+    },
+    "s_7ac9c357fe09fd": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-ffbdf77c-a6fe-4afd-ab72-d4a839eaa916",
+        "model": "default"
+      },
+      "human_author": "mikeq <mikequan0425@foxmail.com>"
+    },
+    "s_90e5790d3270e3": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-f33445af-3778-469f-8bf1-a790dd0595a8",
+        "model": "default"
+      },
+      "human_author": "mikeq <mikequan0425@foxmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
