@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
+import torch
 from omegaconf import OmegaConf
 
 from verl.protocol import DataProto
@@ -162,6 +163,198 @@ class RolloutSkip(BaseSkip):
         if larger_steps:
             return larger_steps[0]
         return -1
+
+    # ── V1 TransferQueue-based save / load ──────────────────────────────────
+    tq_batch_name = "tq_batch.pt"
+
+    def _check_valid_v1_step_path(self, path: Path) -> bool:
+        """Check whether a V1-format cached batch (``tq_batch.pt``) exists at *path*."""
+        if not path.is_dir():
+            return False
+        return (path / self.tq_batch_name).is_file() and (path / self.meta_name).is_file()
+
+    def _get_available_v1_steps(self) -> list[int]:
+        """Return sorted list of steps that have V1-format cached data."""
+        result: list[int] = []
+        project_dir = self._get_project_dump_dir()
+        if not project_dir.is_dir():
+            return result
+        for child in project_dir.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                step = int(child.name)
+            except ValueError:
+                continue
+            if not self._check_valid_v1_step_path(child):
+                continue
+            result.append(step)
+        return sorted(result)
+
+    def _resolve_load_step_v1(self, step: int) -> int:
+        """Return the actual step to load from for V1 path, or -1 if none available.
+
+        - ``cache``: exact step match
+        - ``repeat``: closest available step (prefer smaller, then larger)
+        """
+        if self._check_valid_v1_step_path(self._get_step_dump_dir(step)):
+            return step
+        if self.action == SkipAction.REPEAT:
+            available = self._get_available_v1_steps()
+            if not available:
+                return -1
+            smaller = [s for s in available if s < step]
+            if smaller:
+                return smaller[-1]
+            larger = [s for s in available if s > step]
+            if larger:
+                return larger[0]
+        return -1
+
+    def has_v1_cache(self, step: int) -> bool:
+        """V1 phase check: whether cached TQ batch data exists for *step*.
+
+        Returns True → phase two (load from disk).
+        Returns False → phase one (normal rollout + save).
+        """
+        return self._resolve_load_step_v1(step) != -1
+
+    def save_v1_batch(self, step: int, batch, global_steps: int) -> None:
+        """Phase one: read full batch from TransferQueue and save to disk.
+
+        Args:
+            step: Current training step (used as dump directory name).
+            batch: :class:`transfer_queue.KVBatchMeta` from ``ReplayBuffer.sample()``.
+            global_steps: Current ``global_steps`` for metadata.
+        """
+        import transfer_queue as tq
+
+        step_dir = self._get_step_dump_dir(step)
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        # Read all trajectory fields from TQ
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id)
+
+        save_payload = {
+            "tensordict": data,
+            "tags": batch.tags,
+            "keys": list(batch.keys),
+            "global_steps": global_steps,
+        }
+        torch.save(save_payload, step_dir / self.tq_batch_name)
+
+        meta_path = step_dir / self.meta_name
+        meta_path.write_text(
+            json.dumps({"global_steps": global_steps, "num_trajectories": len(batch.keys)})
+        )
+        print(
+            f"{self.print_mark}\033[33mDump TQ batch at step {step} "
+            f"({len(batch.keys)} trajectories) to {step_dir}\033[0m",
+            flush=True,
+        )
+
+    def load_v1_and_inject(
+        self,
+        step: int,
+        new_prompt_uids: list[str],
+        n: int,
+        global_steps: int,
+        partition_id: str = "train",
+    ) -> None:
+        """Phase two: load cached data from disk and inject into TransferQueue.
+
+        Maps saved trajectories to new prompt uids in order, preserving the
+        original key structure (``{uid}_{session_id}_{index}``) and GRPO group
+        composition (each prompt gets *n* trajectories from the same original group).
+
+        Args:
+            step: Current training step.
+            new_prompt_uids: Freshly generated uids for the current batch.
+            n: Number of trajectories per prompt (``rollout.n``).
+            global_steps: Current ``global_steps``, used to override staleness tags.
+            partition_id: TQ partition (``"train"`` or ``"val"``).
+        """
+        import transfer_queue as tq
+
+        load_step = self._resolve_load_step_v1(step)
+        if load_step == -1:
+            raise FileNotFoundError(
+                f"{self.print_mark}No V1 cached data found for step {step} "
+                f"under {self._get_project_dump_dir()}"
+            )
+
+        step_dir = self._get_step_dump_dir(load_step)
+        save_payload = torch.load(step_dir / self.tq_batch_name, weights_only=False)
+        data = save_payload["tensordict"]
+        old_keys = save_payload["keys"]
+        old_tags = save_payload["tags"]
+
+        # Group saved trajectories by parent uid (key format: {uid}_{session_id}_{index})
+        # ReplayBuffer.sample() returns trajectory keys sorted by uid prefix match,
+        # so consecutive keys with the same prefix belong to the same prompt group.
+        groups: list[list[int]] = []  # groups[i] = list of trajectory indices for prompt i
+        current_uid = None
+        current_group: list[int] = []
+        for idx, key in enumerate(old_keys):
+            parent_uid = key.rsplit("_", 2)[0]  # strip {session_id}_{index}
+            if current_uid is None:
+                current_uid = parent_uid
+            if parent_uid != current_uid:
+                groups.append(current_group)
+                current_group = []
+                current_uid = parent_uid
+            current_group.append(idx)
+        if current_group:
+            groups.append(current_group)
+
+        if len(groups) != len(new_prompt_uids):
+            raise RuntimeError(
+                f"{self.print_mark}Prompt group count mismatch: "
+                f"cached={len(groups)} groups, expected={len(new_prompt_uids)} prompts"
+            )
+
+        # Build new keys/tags by remapping each group to a new uid
+        new_keys = []
+        new_tags = []
+        for group_idx, new_uid in enumerate(new_prompt_uids):
+            group = groups[group_idx]
+            for traj_idx in group:
+                old_key = old_keys[traj_idx]
+                # Extract {session_id}_{index} suffix from original key
+                suffix = old_key.rsplit("_", 2)[1] + "_" + old_key.rsplit("_", 2)[2]
+                new_keys.append(f"{new_uid}_{suffix}")
+                # Preserve trajectory-specific tags, override staleness fields
+                tag = dict(old_tags[traj_idx])
+                tag["global_steps"] = global_steps
+                tag["min_global_steps"] = global_steps
+                tag["max_global_steps"] = global_steps
+                tag.pop("is_prompt", None)
+                new_tags.append(tag)
+
+        # Write trajectory data to TQ
+        tq.kv_batch_put(
+            keys=new_keys,
+            fields=data,
+            tags=new_tags,
+            partition_id=partition_id,
+        )
+
+        # Mark prompt-level keys as finished so ReplayBuffer can pick them up immediately
+        prompt_tags = [
+            {"is_prompt": True, "status": "finished", "global_steps": global_steps}
+        ] * len(new_prompt_uids)
+        tq.kv_batch_put(
+            keys=new_prompt_uids,
+            partition_id=partition_id,
+            tags=prompt_tags,
+        )
+
+        print(
+            f"{self.print_mark}\033[33mInjected {len(new_keys)} cached trajectories "
+            f"from step {load_step} ({len(new_prompt_uids)} prompts × {n}) "
+            f"into TQ partition '{partition_id}' at current step {step}\033[0m",
+            flush=True,
+        )
 
 
 def parse_async_rollout_sample_step(sample_id: str) -> int:
