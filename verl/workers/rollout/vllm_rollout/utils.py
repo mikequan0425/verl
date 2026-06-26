@@ -27,6 +27,7 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.patch import patch_qwen3_moe_fused_expert_weights
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 
 logger = logging.getLogger(__file__)
@@ -193,6 +194,7 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+            patch_qwen3_moe_fused_expert_weights(model)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
@@ -227,6 +229,7 @@ class vLLMColocateWorkerExtension:
             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
             for model in self._iter_all_models():
                 patch_vllm_moe_model_weight_loader(model)
+                patch_qwen3_moe_fused_expert_weights(model)
 
         assert self.device is not None
         receiver = BucketedWeightReceiver(
@@ -284,6 +287,14 @@ class vLLMColocateWorkerExtension:
                     load_quanted_weights(weights, self.model_runner, is_drafter=True)
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
+                # Diagnostic: log weight names to verify MoE expert format
+                sample_names = [name for name, _ in weights[:5]] if hasattr(weights, "__getitem__") else []
+                expert_names = [name for name, _ in weights if "experts" in name] if hasattr(weights, "__getitem__") else []
+                logger.info(
+                    f"Weight sync sample names (first 5): {sample_names}\n"
+                    f"Expert weight names ({len(expert_names)}): {expert_names[:10]}"
+                    f"{'...' if len(expert_names) > 10 else ''}"
+                )
                 for model in self._iter_all_models():
                     model.load_weights(weights)
 

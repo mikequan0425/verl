@@ -140,3 +140,124 @@ def patch_vllm_moe_model_weight_loader(model):
         for name, param in mlp.named_parameters():
             if "w13_weight" in name or "w2_weight" in name:
                 param.weight_loader = experts.weight_loader
+
+
+def _convert_fused_expert_weights(weights, num_experts):
+    """Convert fused expert weights (transformers 5.x) to checkpoint format.
+
+    transformers 5.x stores expert weights as 3D fused tensors:
+        mlp.experts.gate_up_proj  (num_experts, 2*intermediate, hidden)
+        mlp.experts.down_proj     (num_experts, hidden, intermediate)
+
+    Checkpoint format (what vLLM load_weights expects):
+        mlp.experts.0.gate_proj.weight  (intermediate, hidden)
+        mlp.experts.0.up_proj.weight    (intermediate, hidden)
+        mlp.experts.0.down_proj.weight  (hidden, intermediate)
+    """
+    fused_count = 0
+    passthrough_count = 0
+    for name, tensor in weights:
+        if "mlp.experts.gate_up_proj" in name and tensor.dim() == 3:
+            fused_count += 1
+            print(
+                f"[Qwen3Moe-FusedExpert] DETECTED fused gate_up_proj: "
+                f"{name} shape={tuple(tensor.shape)} -> "
+                f"splitting into {num_experts} experts (gate_proj + up_proj)"
+            )
+            # Split fused gate_up_proj into per-expert gate_proj and up_proj
+            gate, up = tensor.chunk(2, dim=1)
+            for expert_id in range(num_experts):
+                yield (
+                    name.replace(
+                        "experts.gate_up_proj",
+                        f"experts.{expert_id}.gate_proj.weight",
+                    ),
+                    gate[expert_id],
+                )
+                yield (
+                    name.replace(
+                        "experts.gate_up_proj",
+                        f"experts.{expert_id}.up_proj.weight",
+                    ),
+                    up[expert_id],
+                )
+        elif "mlp.experts.down_proj" in name and tensor.dim() == 3:
+            fused_count += 1
+            print(
+                f"[Qwen3Moe-FusedExpert] DETECTED fused down_proj: "
+                f"{name} shape={tuple(tensor.shape)} -> "
+                f"splitting into {num_experts} experts (down_proj)"
+            )
+            # Split fused down_proj into per-expert down_proj
+            for expert_id in range(num_experts):
+                yield (
+                    name.replace(
+                        "experts.down_proj",
+                        f"experts.{expert_id}.down_proj.weight",
+                    ),
+                    tensor[expert_id],
+                )
+        else:
+            passthrough_count += 1
+            yield (name, tensor)
+
+    if fused_count > 0:
+        print(
+            f"[Qwen3Moe-FusedExpert] Conversion summary: {fused_count} fused "
+            f"tensors split, {passthrough_count} tensors passed through unchanged"
+        )
+    else:
+        print(
+            f"[Qwen3Moe-FusedExpert] No fused expert tensors detected "
+            f"(all {passthrough_count} tensors passed through unchanged). "
+            f"This is expected for checkpoint/safetensors format."
+        )
+
+
+def patch_qwen3_moe_fused_expert_weights(model):
+    """Patch Qwen3MoeModel.load_weights to support fused expert format from
+    transformers 5.x.
+
+    transformers 5.x refactored Qwen3MoeExperts to use 3D fused tensors
+    (experts.gate_up_proj, experts.down_proj) instead of per-expert 2D
+    tensors (experts.0.gate_proj.weight, etc). vLLM's Qwen3MoeModel.load_weights
+    only understands the checkpoint format, so expert weights are silently
+    skipped and the model produces garbage output.
+
+    This patch wraps load_weights with a pre-processing step that splits
+    the 3D fused tensors back into per-expert 2D tensors in checkpoint format.
+    """
+    try:
+        from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel
+    except ImportError:
+        return
+
+    # Unwrap ACLGraphWrapper if present
+    original_model_type = type(model)
+    if hasattr(model, "runnable") and "ACLGraphWrapper" in str(original_model_type):
+        model = model.runnable
+
+    inner_model = getattr(model, "model", None) or getattr(model, "language_model", None)
+    if inner_model is None:
+        return
+
+    if not isinstance(inner_model, Qwen3MoeModel):
+        return
+
+    if getattr(inner_model, "_fused_expert_patched", False):
+        return
+
+    original_load_weights = inner_model.load_weights
+    num_experts = inner_model.config.num_experts
+
+    print(
+        f"[Qwen3Moe-FusedExpert] Patching Qwen3MoeModel.load_weights "
+        f"(num_experts={num_experts}) to handle transformers 5.x fused expert format"
+    )
+
+    def patched_load_weights(weights):
+        converted = _convert_fused_expert_weights(weights, num_experts)
+        return original_load_weights(converted)
+
+    inner_model.load_weights = patched_load_weights
+    inner_model._fused_expert_patched = True
