@@ -424,12 +424,9 @@ class PPOTrainer(ABC):
             self.on_sample_end()
 
         # Skip: save batch to disk when no cached data exists yet (phase one)
-        skip_inst = SkipManager.skip_instances.get("rollout")
-        if (skip_inst and skip_inst.is_enabled()
-                and self.global_steps in skip_inst.steps
-                and batch.partition_id == "train"
-                and not skip_inst.has_v1_cache(self.global_steps)):
-            skip_inst.save_v1_batch(
+        skip_inst = SkipManager.skip_instances.get("rollout_tq")
+        if skip_inst and skip_inst.should_save(self.global_steps, batch.partition_id):
+            skip_inst.prepare_data(
                 step=self.global_steps,
                 batch=batch,
                 global_steps=self.global_steps,
@@ -1123,13 +1120,10 @@ class PPOTrainer(ABC):
         batch = tu.get_tensordict(batch_dict)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
 
-
         # Skip: if V1 rollout skip is enabled and cached data exists, inject into TQ directly
-        skip_inst = SkipManager.skip_instances.get("rollout")
-        if (skip_inst and skip_inst.is_enabled()
-                and self.global_steps in skip_inst.steps
-                and skip_inst.has_v1_cache(self.global_steps)):
-            skip_inst.load_v1_and_inject(
+        skip_inst = SkipManager.skip_instances.get("rollout_tq")
+        if skip_inst and skip_inst.meet_precondition(self.global_steps):
+            skip_inst.load_dump_data(
                 step=self.global_steps,
                 new_prompt_uids=list(batch["uid"]),
                 n=self.config.actor_rollout_ref.rollout.n,

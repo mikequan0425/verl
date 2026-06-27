@@ -164,7 +164,19 @@ class RolloutSkip(BaseSkip):
             return larger_steps[0]
         return -1
 
-    # ── V1 TransferQueue-based save / load ──────────────────────────────────
+
+
+@register_skip("rollout_tq")
+class RolloutTqSkip(RolloutSkip):
+    """Rollout skip for V1 TransferQueue-based trainer (``skip.rollout_tq``).
+
+    Unlike V0's decorator pattern, V1's split architecture (submit prompts to TQ,
+    then sample trajectories) requires direct method calls from the trainer:
+    - Phase one (no cache): trainer calls ``prepare_data`` after ``replay_buffer.sample``
+    - Phase two (cache exists): trainer calls ``load_dump_data`` in ``_add_batch_to_generate``
+    """
+
+    print_mark = "[RolloutTqSkip()] "
     tq_batch_name = "tq_batch.pt"
 
     def _check_valid_v1_step_path(self, path: Path) -> bool:
@@ -173,7 +185,7 @@ class RolloutSkip(BaseSkip):
             return False
         return (path / self.tq_batch_name).is_file() and (path / self.meta_name).is_file()
 
-    def _get_available_v1_steps(self) -> list[int]:
+    def _get_available_steps_v1(self) -> list[int]:
         """Return sorted list of steps that have V1-format cached data."""
         result: list[int] = []
         project_dir = self._get_project_dump_dir()
@@ -200,7 +212,7 @@ class RolloutSkip(BaseSkip):
         if self._check_valid_v1_step_path(self._get_step_dump_dir(step)):
             return step
         if self.action == SkipAction.REPEAT:
-            available = self._get_available_v1_steps()
+            available = self._get_available_steps_v1()
             if not available:
                 return -1
             smaller = [s for s in available if s < step]
@@ -214,12 +226,29 @@ class RolloutSkip(BaseSkip):
     def has_v1_cache(self, step: int) -> bool:
         """V1 phase check: whether cached TQ batch data exists for *step*.
 
-        Returns True → phase two (load from disk).
-        Returns False → phase one (normal rollout + save).
+        Returns True -> phase two (load from disk).
+        Returns False -> phase one (normal rollout + save).
         """
         return self._resolve_load_step_v1(step) != -1
 
-    def save_v1_batch(self, step: int, batch, global_steps: int) -> None:
+    def meet_precondition(self, step: int, *args, **kwargs) -> bool:
+        """Phase two: whether cached data exists and should be loaded/injected.
+
+        Overrides V0's ``meet_precondition``.  V1 does not use the decorator
+        pattern, so ``func``/``*args`` are accepted but ignored.
+        """
+        return self.is_enabled() and step in self.steps and self.has_v1_cache(step)
+
+    def should_save(self, step: int, partition_id: str = "train") -> bool:
+        """Phase one: whether the sampled batch should be saved to disk."""
+        return (
+            self.is_enabled()
+            and step in self.steps
+            and partition_id == "train"
+            and not self.has_v1_cache(step)
+        )
+
+    def prepare_data(self, step: int, batch, global_steps: int) -> None:
         """Phase one: read full batch from TransferQueue and save to disk.
 
         Args:
@@ -227,6 +256,12 @@ class RolloutSkip(BaseSkip):
             batch: :class:`transfer_queue.KVBatchMeta` from ``ReplayBuffer.sample()``.
             global_steps: Current ``global_steps`` for metadata.
         """
+        print(
+            f"{self.print_mark}\033[33mNo dumped data found "
+            f"from {self._get_project_dump_dir()}. "
+            f"The trainer will generate and dump the data.\033[0m",
+            flush=True,
+        )
         import transfer_queue as tq
 
         step_dir = self._get_step_dump_dir(step)
@@ -253,7 +288,7 @@ class RolloutSkip(BaseSkip):
             flush=True,
         )
 
-    def load_v1_and_inject(
+    def load_dump_data(
         self,
         step: int,
         new_prompt_uids: list[str],
@@ -279,7 +314,7 @@ class RolloutSkip(BaseSkip):
         load_step = self._resolve_load_step_v1(step)
         if load_step == -1:
             raise FileNotFoundError(
-                f"{self.print_mark}No V1 cached data found for step {step} "
+                f"{self.print_mark}No dump data found for step {step} "
                 f"under {self._get_project_dump_dir()}"
             )
 
@@ -291,22 +326,13 @@ class RolloutSkip(BaseSkip):
 
         # Group saved trajectories by parent uid.
         # Key format: {uid}_{session_id}_{index}, uid is UUID4 (no underscores).
-        # ReplayBuffer.sample() returns keys sorted by uid prefix, so consecutive
-        # keys with the same prefix belong to the same prompt group.
-        groups: list[list[int]] = []
-        current_uid = None
-        current_group: list[int] = []
+        # ReplayBuffer.sample() does NOT guarantee keys are sorted by uid prefix,
+        # so we use a dict to group regardless of key ordering.
+        uid_to_indices: dict[str, list[int]] = {}
         for idx, key in enumerate(old_keys):
             parent_uid = key.split("_")[0]
-            if current_uid is None:
-                current_uid = parent_uid
-            if parent_uid != current_uid:
-                groups.append(current_group)
-                current_group = []
-                current_uid = parent_uid
-            current_group.append(idx)
-        if current_group:
-            groups.append(current_group)
+            uid_to_indices.setdefault(parent_uid, []).append(idx)
+        groups = list(uid_to_indices.values())
 
         if not groups:
             raise RuntimeError(
@@ -335,10 +361,12 @@ class RolloutSkip(BaseSkip):
         # If cached groups < new prompts, cycle through groups (modulo).
         new_keys = []
         new_tags = []
+        traj_indices: list[int] = []
         for prompt_idx, new_uid in enumerate(new_prompt_uids):
             group = groups[prompt_idx % num_cached_groups]
             for session_id in range(n):
                 traj_idx = group[session_id % len(group)]
+                traj_indices.append(traj_idx)
                 new_keys.append(f"{new_uid}_{session_id}_0")
                 tag = dict(old_tags[traj_idx])
                 tag["global_steps"] = global_steps
@@ -347,11 +375,13 @@ class RolloutSkip(BaseSkip):
                 tag.pop("is_prompt", None)
                 new_tags.append(tag)
 
+        # Select/reorder rows from the saved tensordict to match new_keys.
+        new_fields = data[torch.tensor(traj_indices, dtype=torch.long)]
 
         # Write trajectory data to TQ
         tq.kv_batch_put(
             keys=new_keys,
-            fields=data,
+            fields=new_fields,
             tags=new_tags,
             partition_id=partition_id,
         )
@@ -368,7 +398,7 @@ class RolloutSkip(BaseSkip):
 
         print(
             f"{self.print_mark}\033[33mInjected {len(new_keys)} cached trajectories "
-            f"from step {load_step} ({len(new_prompt_uids)} prompts × {n}) "
+            f"from step {load_step} ({len(new_prompt_uids)} prompts x {n}) "
             f"into TQ partition '{partition_id}' at current step {step}\033[0m",
             flush=True,
         )
