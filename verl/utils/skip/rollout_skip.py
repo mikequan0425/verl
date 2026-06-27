@@ -289,14 +289,15 @@ class RolloutSkip(BaseSkip):
         old_keys = save_payload["keys"]
         old_tags = save_payload["tags"]
 
-        # Group saved trajectories by parent uid (key format: {uid}_{session_id}_{index})
-        # ReplayBuffer.sample() returns trajectory keys sorted by uid prefix match,
-        # so consecutive keys with the same prefix belong to the same prompt group.
-        groups: list[list[int]] = []  # groups[i] = list of trajectory indices for prompt i
+        # Group saved trajectories by parent uid.
+        # Key format: {uid}_{session_id}_{index}, uid is UUID4 (no underscores).
+        # ReplayBuffer.sample() returns keys sorted by uid prefix, so consecutive
+        # keys with the same prefix belong to the same prompt group.
+        groups: list[list[int]] = []
         current_uid = None
         current_group: list[int] = []
         for idx, key in enumerate(old_keys):
-            parent_uid = key.rsplit("_", 2)[0]  # strip {session_id}_{index}
+            parent_uid = key.split("_")[0]
             if current_uid is None:
                 current_uid = parent_uid
             if parent_uid != current_uid:
@@ -307,29 +308,45 @@ class RolloutSkip(BaseSkip):
         if current_group:
             groups.append(current_group)
 
-        if len(groups) != len(new_prompt_uids):
+        if not groups:
             raise RuntimeError(
-                f"{self.print_mark}Prompt group count mismatch: "
-                f"cached={len(groups)} groups, expected={len(new_prompt_uids)} prompts"
+                f"{self.print_mark}No trajectory groups found in cached data "
+                f"({len(old_keys)} keys) at step {load_step}"
             )
 
-        # Build new keys/tags by remapping each group to a new uid
+        num_cached_groups = len(groups)
+        num_prompts = len(new_prompt_uids)
+        if num_cached_groups < num_prompts:
+            print(
+                f"{self.print_mark}\033[33mCached {num_cached_groups} prompt groups but need {num_prompts} "
+                f"prompts; will cycle through available groups to fill\033[0m",
+                flush=True,
+            )
+        elif num_cached_groups > num_prompts:
+            print(
+                f"{self.print_mark}\033[33mCached {num_cached_groups} prompt groups but only need {num_prompts} "
+                f"prompts; using first {num_prompts} groups\033[0m",
+                flush=True,
+            )
+
+        # Build new keys/tags: map each new uid to a cached group.
+        # If group has fewer than *n* trajectories (some sessions failed),
+        # cycle within the group to fill *n* trajectories.
+        # If cached groups < new prompts, cycle through groups (modulo).
         new_keys = []
         new_tags = []
-        for group_idx, new_uid in enumerate(new_prompt_uids):
-            group = groups[group_idx]
-            for traj_idx in group:
-                old_key = old_keys[traj_idx]
-                # Extract {session_id}_{index} suffix from original key
-                suffix = old_key.rsplit("_", 2)[1] + "_" + old_key.rsplit("_", 2)[2]
-                new_keys.append(f"{new_uid}_{suffix}")
-                # Preserve trajectory-specific tags, override staleness fields
+        for prompt_idx, new_uid in enumerate(new_prompt_uids):
+            group = groups[prompt_idx % num_cached_groups]
+            for session_id in range(n):
+                traj_idx = group[session_id % len(group)]
+                new_keys.append(f"{new_uid}_{session_id}_0")
                 tag = dict(old_tags[traj_idx])
                 tag["global_steps"] = global_steps
                 tag["min_global_steps"] = global_steps
                 tag["max_global_steps"] = global_steps
                 tag.pop("is_prompt", None)
                 new_tags.append(tag)
+
 
         # Write trajectory data to TQ
         tq.kv_batch_put(
