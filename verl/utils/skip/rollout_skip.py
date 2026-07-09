@@ -165,7 +165,6 @@ class RolloutSkip(BaseSkip):
         return -1
 
 
-
 @register_skip("rollout_tq")
 class RolloutTqSkip(RolloutSkip):
     """Rollout skip for V1 TransferQueue-based trainer (``skip.rollout_tq``).
@@ -293,9 +292,7 @@ class RolloutTqSkip(RolloutSkip):
         torch.save(save_payload, step_dir / self.tq_batch_name)
 
         meta_path = step_dir / self.meta_name
-        meta_path.write_text(
-            json.dumps({"global_steps": global_steps, "num_trajectories": len(batch.keys)})
-        )
+        meta_path.write_text(json.dumps({"global_steps": global_steps, "num_trajectories": len(batch.keys)}))
         print(
             f"{self.print_mark}\033[33mDump TQ batch at step {step} "
             f"({len(batch.keys)} trajectories) to {step_dir}\033[0m",
@@ -328,8 +325,7 @@ class RolloutTqSkip(RolloutSkip):
         load_step = self._resolve_load_step_v1(step)
         if load_step == -1:
             raise FileNotFoundError(
-                f"{self.print_mark}No dump data found for step {step} "
-                f"under {self._get_project_dump_dir()}"
+                f"{self.print_mark}No dump data found for step {step} under {self._get_project_dump_dir()}"
             )
 
         step_dir = self._get_step_dump_dir(load_step)
@@ -350,8 +346,7 @@ class RolloutTqSkip(RolloutSkip):
 
         if not groups:
             raise RuntimeError(
-                f"{self.print_mark}No trajectory groups found in cached data "
-                f"({len(old_keys)} keys) at step {load_step}"
+                f"{self.print_mark}No trajectory groups found in cached data ({len(old_keys)} keys) at step {load_step}"
             )
 
         num_cached_groups = len(groups)
@@ -404,9 +399,7 @@ class RolloutTqSkip(RolloutSkip):
         )
 
         # Mark prompt-level keys as finished so ReplayBuffer can pick them up immediately
-        prompt_tags = [
-            {"is_prompt": True, "status": "finished", "global_steps": global_steps}
-        ] * len(new_prompt_uids)
+        prompt_tags = [{"is_prompt": True, "status": "finished", "global_steps": global_steps}] * len(new_prompt_uids)
         tq.kv_batch_put(
             keys=new_prompt_uids,
             partition_id=partition_id,

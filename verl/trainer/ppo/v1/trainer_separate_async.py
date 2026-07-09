@@ -101,7 +101,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
-        if self.config.skip.rollout_tq.enabled:
+        if self.config.skip.rollout_tq.enable:
             return
         num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
         for _ in range(num_warmup_batches):

@@ -143,6 +143,7 @@ class SkipManager:
           ``sample`` runs, if the skip instance says to save, persist the result to disk
           (phase one / cache-miss).
         """
+
         def decorator(func: Callable) -> Callable:
             @functools.wraps(func)
             def wrapper(self, *args, **kwargs):
