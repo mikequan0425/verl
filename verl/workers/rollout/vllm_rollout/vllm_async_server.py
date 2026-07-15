@@ -248,6 +248,13 @@ class vLLMHttpServer:
         self._pd_prefill_engine_id = prefill_engine_id
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        # Apply sampler patch to avoid OOM in log_softmax when calculate_log_probs=True.
+        # Must be applied before the vLLM engine is created so forked workers inherit it.
+        if self.config.calculate_log_probs:
+            from verl.utils.vllm.sampler_patch import patch_vllm_sampler_for_logprobs_0
+
+            patch_vllm_sampler_for_logprobs_0()
+
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
