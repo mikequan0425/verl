@@ -37,6 +37,7 @@ async def test_hccl_checkpoint_engine(
     num_rollout,
     num_nodes=1,
     num_gpus_per_node=8,
+    bucket_size_mb=128,
     check_allclose=True,
     model_path="~/models/Qwen/Qwen3-8B-Base",
 ):
@@ -54,7 +55,9 @@ async def test_hccl_checkpoint_engine(
 
     # initialize config
     checkpoint_engine_config = CheckpointEngineConfig(
-        backend="nccl", engine_kwargs={"nccl": {"rebuild_group": rebuild_group}}
+        backend="nccl",
+        update_weights_bucket_megabytes=bucket_size_mb,
+        engine_kwargs={"nccl": {"rebuild_group": rebuild_group}},
     )
     model_config = HFModelConfig(path=model_path, use_remove_padding=True)
     rollout_config = RolloutConfig(name="vllm", checkpoint_engine=checkpoint_engine_config)
@@ -178,6 +181,7 @@ if __name__ == "__main__":
         num_rollout=6,
         num_nodes=1,
         num_gpus_per_node=8,
+        bucket_size_mb=128,
         check_allclose=False,
         model_path=os.environ["HDFS_ROOT"] + "/model/Qwen3-30B-A3B-Base",
     )
