@@ -25,6 +25,13 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
+def _normalize_aux_loss(aux_loss, local_num_tokens, global_num_tokens, dp_size):
+    """Convert a locally normalized auxiliary loss into a global mini-batch partial."""
+    if global_num_tokens <= 0:
+        return aux_loss * 0
+    return aux_loss * local_num_tokens / global_num_tokens * dp_size
+
+
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
@@ -81,6 +88,54 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metric_aggregation = AggregationType.MEAN
 
     metrics = {}
+
+    mtp_aux_loss = model_output.get("mtp_aux_loss", None)
+    mtp_contribution = None
+    if mtp_aux_loss is not None:
+        mtp_scale = tu.get_non_tensor_data(data=data, key="mtp_loss_scaling_factor", default=None)
+        global_mtp_num_tokens = tu.get_non_tensor_data(data=data, key="mtp_batch_num_tokens", default=None)
+        local_mtp_num_tokens = model_output.get("mtp_num_tokens", None)
+        if mtp_scale is None or global_mtp_num_tokens is None or local_mtp_num_tokens is None:
+            raise ValueError("MTP loss fields require mtp_loss_scaling_factor and global token statistics.")
+        normalized_mtp_aux_loss = _normalize_aux_loss(
+            mtp_aux_loss,
+            local_mtp_num_tokens,
+            global_mtp_num_tokens,
+            data["dp_size"],
+        )
+        mtp_contribution = mtp_scale * normalized_mtp_aux_loss
+        metrics["actor/mtp_aux_loss"] = Metric(
+            value=normalized_mtp_aux_loss,
+            aggregation=metric_aggregation,
+        )
+        metrics["actor/mtp_loss_contribution"] = Metric(
+            value=mtp_contribution,
+            aggregation=metric_aggregation,
+        )
+
+    moe_aux_loss = model_output.get("moe_aux_loss", None)
+    moe_contribution = None
+    if moe_aux_loss is not None:
+        router_aux_loss_coef = tu.get_non_tensor_data(data=data, key="router_aux_loss_coef", default=None)
+        global_moe_num_tokens = tu.get_non_tensor_data(data=data, key="moe_batch_num_tokens", default=None)
+        local_moe_num_tokens = model_output.get("moe_num_tokens", None)
+        if router_aux_loss_coef is None or global_moe_num_tokens is None or local_moe_num_tokens is None:
+            raise ValueError("MoE auxiliary loss requires router_aux_loss_coef and global token statistics.")
+        normalized_moe_aux_loss = _normalize_aux_loss(
+            moe_aux_loss,
+            local_moe_num_tokens,
+            global_moe_num_tokens,
+            data["dp_size"],
+        )
+        moe_contribution = router_aux_loss_coef * normalized_moe_aux_loss
+        metrics["actor/moe_aux_loss"] = Metric(
+            value=normalized_moe_aux_loss,
+            aggregation=metric_aggregation,
+        )
+        metrics["actor/moe_loss_contribution"] = Metric(
+            value=moe_contribution,
+            aggregation=metric_aggregation,
+        )
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
@@ -140,6 +195,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    if mtp_contribution is not None:
+        policy_loss += mtp_contribution
+    if moe_contribution is not None:
+        policy_loss += moe_contribution
 
     return policy_loss, metrics
 

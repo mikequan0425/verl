@@ -378,6 +378,16 @@ class VeOmniActorConfig(ActorConfig):
                 "actor.use_remove_padding=True or router_replay.mode='disabled'."
             )
 
+    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+        """Validate VeOmni actor configuration with runtime parameters."""
+        super().validate(n_gpus, train_batch_size, model_config)
+        mtp = model_config.get("mtp", {}) if model_config else {}
+        if mtp.get("enable_train", False) and self.veomni.ulysses_parallel_size > 1:
+            raise ValueError(
+                "VeOmni Qwen3.5 MTP training does not support sequence parallelism yet. "
+                "Set actor_rollout_ref.actor.veomni.ulysses_parallel_size=1 or disable "
+                "actor_rollout_ref.model.mtp.enable_train."
+            )
 
 @dataclass
 class TorchTitanActorConfig(ActorConfig):

@@ -164,6 +164,12 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
 
     # concat results from micro batches
     for key, val in model_output.items():
+        # Scalar auxiliary losses and token counts are per micro-batch values, not
+        # jagged per-sample tensors, so preserve them as a flat tensor.
+        if all(torch.is_tensor(item) and not item.is_nested and item.ndim == 0 for item in val):
+            model_output[key] = torch.stack(val)
+            continue
+
         if pad_mode == DatasetPadMode.NO_PADDING:
             tensors = [tensor for nt in model_output[key] for tensor in nt.unbind()]
             model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)

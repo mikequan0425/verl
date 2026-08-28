@@ -25,7 +25,7 @@ from veomni.arguments import MixedPrecisionConfig, OpsImplementationConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models.auto import build_foundation_model
+from veomni.models.auto import build_config, build_foundation_model
 from veomni.models.checkpoint_tensor_loading import get_checkpoint_tensor_converter
 from veomni.optim import build_lr_scheduler, build_optimizer
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
@@ -48,6 +48,7 @@ from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimiz
 from ..base import BaseEngineCtx, EngineRegistry
 from ..fsdp.transformer_impl import FSDPEngine, FSDPEngineWithLMHead, FSDPEngineWithValueHead
 from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+from .mtp import build_mtp_labels, count_mtp_targets
 from .utils import (
     VL_TYPE2INDEX,
     get_moe_param_handler,
@@ -189,6 +190,13 @@ class VeOmniEngine(FSDPEngine):
         self.use_ulysses_sp = parallel_state.get_parallel_state().sp_enabled
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_parallel_size
 
+        if self.model_config.mtp.enable_train and self.engine_config.ulysses_parallel_size > 1:
+            raise ValueError(
+                "VeOmni Qwen3.5 MTP training does not support sequence parallelism yet. "
+                "Set actor_rollout_ref.actor.veomni.ulysses_parallel_size=1 or disable "
+                "actor_rollout_ref.model.mtp.enable_train."
+            )
+
         if self.use_ulysses_sp:
             self.ulysses_parallel_group = parallel_state.get_parallel_state().device_mesh["sp"].get_group()
         else:
@@ -296,6 +304,18 @@ class VeOmniEngine(FSDPEngine):
         )
 
         return lr_scheduler
+
+    def _get_foundation_num_tokens(self, data: TensorDict) -> torch.Tensor:
+        """Return foundation router rows, including packed static padding when present."""
+        input_ids = data["input_ids"]
+        attention_mask = data.get("attention_mask", None)
+        if input_ids.is_nested:
+            foundation_num_tokens = input_ids.offsets()[-1].clone()
+        elif attention_mask is not None:
+            foundation_num_tokens = attention_mask.sum()
+        else:
+            foundation_num_tokens = torch.tensor(input_ids.numel(), device=input_ids.device)
+        return foundation_num_tokens.reshape(()).to(torch.long)
 
     def _get_model_config_path(self):
         """Return the config path (or PretrainedConfig) for build_foundation_model.
@@ -407,6 +427,51 @@ class VeOmniEngine(FSDPEngine):
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
+
+        mtp_train_enabled = self.model_config.mtp.enable_train and not forward_only
+        if mtp_train_enabled:
+            mtp_num_depths = self._get_mtp_num_depths()
+            local_mtp_num_tokens = count_mtp_targets(
+                input_ids=data["input_ids"],
+                response_mask=data["response_mask"],
+                num_depths=mtp_num_depths,
+                attention_mask=data.get("attention_mask", None),
+            ).to(get_device_id())
+            torch.distributed.all_reduce(
+                local_mtp_num_tokens,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.get_data_parallel_group(),
+            )
+
+            local_moe_num_tokens = None
+            if self._is_moe_model():
+                local_moe_num_tokens = self._get_foundation_num_tokens(data).to(get_device_id())
+                if tu.get_non_tensor_data(data=data, key="use_remove_padding", default=True):
+                    # VeOmni routes packed static-pad suffixes as foundation rows. The bucket
+                    # padding is per micro-batch, so it cannot be derived from the full batch.
+                    for micro_batch in micro_batches:
+                        packed_length = int(micro_batch["input_ids"].offsets()[-1].item())
+                        local_moe_num_tokens += self._get_packed_pad_size(packed_length)
+                torch.distributed.all_reduce(
+                    local_moe_num_tokens,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_data_parallel_group(),
+                )
+
+            tu.assign_non_tensor(data, mtp_enable_train=True)
+            tu.assign_non_tensor(data, mtp_batch_num_tokens=int(local_mtp_num_tokens.item()))
+            tu.assign_non_tensor(
+                data,
+                moe_batch_num_tokens=(
+                    int(local_moe_num_tokens.item()) if local_moe_num_tokens is not None else 0
+                ),
+            )
+            tu.assign_non_tensor(
+                data,
+                mtp_loss_scaling_factor=self.model_config.mtp.mtp_loss_scaling_factor,
+            )
+            if self._is_moe_model():
+                tu.assign_non_tensor(data, router_aux_loss_coef=self._get_router_aux_loss_coef())
 
         # Router replay state machine: decide RECORD vs REPLAY for this step.
         # RECORD: R2 compute_log_prob (forward_only=True).
@@ -864,6 +929,48 @@ def _prepare_veomni_flash_attention_kwargs(position_ids: torch.Tensor) -> dict[s
 
 @EngineRegistry.register(model_type="language_model", backend=["veomni"], device=["cuda", "npu"])
 class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
+    def _get_model_config_path(self):
+        """Build a config with the MTP head enabled for actor training.
+
+        VeOmni uses ``text_config.mtp_loss_weight`` as the model-side switch that constructs
+        the Qwen3.5 MTP head. The value is fixed to one here; verl applies the RL training
+        scale in its actor loss instead so the foundation policy loss and MTP loss remain
+        independently normalized.
+        """
+        if not self.model_config.mtp.enable_train:
+            return super()._get_model_config_path()
+
+        if not self.model_config.mtp.enable:
+            raise ValueError("`mtp.enable_train=True` requires `mtp.enable=True`.")
+
+        config = build_config(self.model_config.local_hf_config_path)
+        text_config = getattr(config, "text_config", config)
+        mtp_num_layers = int(getattr(text_config, "mtp_num_hidden_layers", 0))
+        if mtp_num_layers <= 0:
+            raise ValueError(
+                "VeOmni MTP training requires a Qwen3.5-style config with "
+                "`text_config.mtp_num_hidden_layers > 0`."
+            )
+
+        text_config.mtp_loss_weight = 1.0
+        return config
+
+    def _get_mtp_num_depths(self) -> int:
+        config = self.model_config.hf_config
+        text_config = getattr(config, "text_config", config)
+        return int(getattr(text_config, "mtp_num_hidden_layers", 0))
+
+    def _is_moe_model(self) -> bool:
+        config = self.model_config.hf_config
+        text_config = getattr(config, "text_config", config)
+        model_type = getattr(config, "model_type", "")
+        return getattr(text_config, "num_experts", None) is not None or model_type.endswith("_moe")
+
+    def _get_router_aux_loss_coef(self) -> float:
+        config = self.model_config.hf_config
+        text_config = getattr(config, "text_config", config)
+        return float(getattr(text_config, "router_aux_loss_coef", 0.0))
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
         self._apply_veomni_input_transforms(model_inputs, micro_batch)
@@ -875,6 +982,30 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
         # prepare_model_outputs().squeeze(0) then lands at (total_nnz,).
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+        mtp_train_enabled = tu.get_non_tensor_data(data=micro_batch, key="mtp_enable_train", default=False)
+        if mtp_train_enabled:
+            mtp_num_depths = self._get_mtp_num_depths()
+            if use_remove_padding:
+                mtp_labels = build_mtp_labels(
+                    input_ids=micro_batch["input_ids"],
+                    response_mask=micro_batch["response_mask"],
+                    num_depths=mtp_num_depths,
+                )
+                pad_size = int(output_args.get("pad_size", 0))
+                if pad_size:
+                    mtp_labels = torch.nn.functional.pad(mtp_labels, (0, pad_size), value=-100)
+            else:
+                mtp_labels = build_mtp_labels(
+                    input_ids=model_inputs["input_ids"],
+                    response_mask=micro_batch["response_mask"],
+                    num_depths=mtp_num_depths,
+                    attention_mask=model_inputs["attention_mask"],
+                )
+            model_inputs["mtp_labels"] = mtp_labels
+
+            if self._is_moe_model():
+                model_inputs["output_router_logits"] = True
+
         if use_fused_kernels and use_remove_padding:
             input_ids_rmpad = model_inputs["input_ids"]
             shift_labels = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
@@ -916,6 +1047,36 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
         self._maybe_push_router_replay_state(micro_batch, output_args)
 
         return model_inputs, output_args
+
+    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+        model_output = super().prepare_model_outputs(
+            output=output,
+            output_args=output_args,
+            micro_batch=micro_batch,
+            logits_processor_func=logits_processor_func,
+        )
+
+        mtp_train_enabled = tu.get_non_tensor_data(data=micro_batch, key="mtp_enable_train", default=False)
+        if not mtp_train_enabled:
+            return model_output
+
+        mtp_aux_loss = getattr(output, "mtp_aux_loss", None)
+        mtp_num_tokens = getattr(output, "mtp_num_tokens", None)
+        if mtp_aux_loss is None or mtp_num_tokens is None:
+            raise RuntimeError("VeOmni model did not return MTP loss fields during MTP training.")
+
+        model_output["mtp_aux_loss"] = mtp_aux_loss
+        model_output["mtp_num_tokens"] = mtp_num_tokens
+
+        if self._is_moe_model():
+            moe_aux_loss = getattr(output, "aux_loss", None)
+            moe_num_tokens = getattr(output, "moe_num_tokens", None)
+            if moe_aux_loss is None or moe_num_tokens is None:
+                raise RuntimeError("VeOmni MoE model did not return router auxiliary-loss fields.")
+            model_output["moe_aux_loss"] = moe_aux_loss
+            model_output["moe_num_tokens"] = moe_num_tokens
+
+        return model_output
 
     def _maybe_push_router_replay_state(self, micro_batch: TensorDict, output_args: dict) -> None:
         rr = self._router_replay

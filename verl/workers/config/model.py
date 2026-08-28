@@ -235,6 +235,8 @@ class HFModelConfig(BaseConfig):
         # downstream engine/worker code does not need to handle each MTP field format
         # individually. Supports both DeepSeek-style (num_nextn_predict_layers) and
         # Qwen3.5-style (mtp_num_hidden_layers, possibly nested under text_config).
+        if self.mtp.enable_train and not self.mtp.enable:
+            raise ValueError("`mtp.enable_train=True` requires `mtp.enable=True`.")
         if not self.mtp.enable:
             if hasattr(self.hf_config, "num_nextn_predict_layers"):
                 self.hf_config.num_nextn_predict_layers = 0
