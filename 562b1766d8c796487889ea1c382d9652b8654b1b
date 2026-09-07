@@ -1,0 +1,40 @@
+verl/utils/skip/rollout_skip.py
+  h_00d3a946329f2f 176-181,187-222,243,254,326-331,342,344,348,381-397
+verl/utils/skip/skip_manager.py
+  h_00d3a946329f2f 144-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "562b1766d8c796487889ea1c382d9652b8654b1b",
+  "prompts": {},
+  "humans": {
+    "h_00d3a946329f2f": {
+      "author": "mikeq <mikequan0425@foxmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {
+    "s_ec1821a5bffaca": {
+      "tool": "trae",
+      "conversation_id": "6a433f2151982f09d447cc6d",
+      "session_id": "6a433f2151982f09d447cc6d",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ec1821a5bffaca::t_1f30a75c172a6f": {
+      "tool": "trae",
+      "conversation_id": "6a433f2151982f09d447cc6d",
+      "session_id": "6a433f2151982f09d447cc6d",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_ec1821a5bffaca::t_9eec4f903ed3d3": {
+      "tool": "trae",
+      "conversation_id": "6a433f2151982f09d447cc6d",
+      "session_id": "6a433f2151982f09d447cc6d",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}

@@ -1,0 +1,16 @@
+verl/utils/skip/rollout_skip.py
+  h_00d3a946329f2f 181,199,303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9eab332f888d3ddf6393f9cece3e05b14f2c6414",
+  "prompts": {},
+  "humans": {
+    "h_00d3a946329f2f": {
+      "author": "mikeq <mikequan0425@foxmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
