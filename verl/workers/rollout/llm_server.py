@@ -70,6 +70,7 @@ def _parse_spec_decode_counters(text: str) -> dict[str, float] | None:
 
     return totals if found == set(totals) else None
 
+
 class LLMServerClient:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -438,7 +439,7 @@ class LLMServerManager:
         if start_rank is None:
             start_rank = self.start_rank
         rollout_world_size = (
-                self.rollout_config.tensor_model_parallel_size
+            self.rollout_config.tensor_model_parallel_size
             * self.rollout_config.data_parallel_size
             * self.rollout_config.pipeline_model_parallel_size
         )
