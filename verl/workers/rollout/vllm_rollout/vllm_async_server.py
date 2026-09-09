@@ -379,9 +379,7 @@ class vLLMHttpServer:
             compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
-        mtp_rollout_enabled = (
-            self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout
-        )
+        mtp_rollout_enabled = self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout
         supports_request_spec_stats = _supports_per_request_spec_decode_metrics()
         args = {
             "dtype": self.config.dtype,
