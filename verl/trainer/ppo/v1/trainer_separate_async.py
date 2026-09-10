@@ -207,6 +207,20 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self.switch_to_rollout()
 
     def on_step_begin(self):
+        # Keep hybrid replicas in rollout mode while validation overlaps this step's rollout.
+        if self._has_pending_parallel_validation():
+            logger.info("Deferring switch to trainer until parallel validation drains")
+            self._step_sample_wait_seconds = 0.0
+            self._step_wait_samples = 0
+            if self.hybrid_rollout_config.enable_switch:
+                self.timing_raw["switch_wait"] = 0.0
+                # Preserve the normal inventory gate. The actual switch is deferred until
+                # prepare_step has submitted this step's train batch and validation drains.
+                self._step_threshold = self._switch_threshold()
+            else:
+                self._step_threshold = 0
+            return
+
         self._step_sample_wait_seconds = 0.0
         self._step_wait_samples = 0
         self._step_threshold = 0
@@ -219,7 +233,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             return
 
         self._step_threshold = self._switch_threshold()
-        sampleable_count = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
+        with self._replay_buffer_lock:
+            sampleable_count = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
         if sampleable_count >= self._step_threshold:
             self._timed_switch_to_trainer()
 
@@ -233,7 +248,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def on_sample_begin(self):
         if self.hybrid_rollout_config.enable_switch:
-            sampleable = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
+            with self._replay_buffer_lock:
+                sampleable = self.replay_buffer.get_sampleable_count(self.global_steps, "train")
             mini_batch_size = self.config.data.train_batch_size // self.parameter_sync_step
             self._step_wait_samples += max(0, mini_batch_size - sampleable)
         self._sample_start = time.perf_counter()
@@ -250,11 +266,17 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         if self.current_mode != HybridEngineMode.ROLLOUT:
             return {}
 
+        # Validation may have used hybrid replicas. Drain it before those replicas are
+        # aborted and slept for training. The next train batch was already submitted by
+        # prepare_step(), so its generation still overlapped validation.
+        self._wait_parallel_validation()
+
         logger.info(f"Lending hybrid engine to generation until {self._step_threshold} groups are sampleable")
         with marked_timer("switch_wait", self.timing_raw, color="yellow"):
-            _, eviction_metrics = self.replay_buffer.wait_for_sampleable(
-                self.global_steps, "train", self._step_threshold
-            )
+            with self._replay_buffer_lock:
+                _, eviction_metrics = self.replay_buffer.wait_for_sampleable(
+                    self.global_steps, "train", self._step_threshold
+                )
         self._timed_switch_to_trainer()
         return eviction_metrics
 
@@ -295,6 +317,9 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         )
 
     def on_step_end(self):
+        # Standalone weight sync aborts in-flight requests, including validation.
+        self._wait_parallel_validation()
+
         # _stop_profiling() already moved this step's flag to prev_step_profile.
         if self.prev_step_profile:
             self._stop_rollout_profiling()
@@ -313,7 +338,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 self._adapt_switch_threshold(had_idle)
 
             decision_threshold = self._switch_threshold()
-            sampleable_count = self.replay_buffer.get_sampleable_count(self.global_steps + 1, "train")
+            with self._replay_buffer_lock:
+                sampleable_count = self.replay_buffer.get_sampleable_count(self.global_steps + 1, "train")
             remaining = max(0, decision_threshold - sampleable_count)
             per_sample_time = self._wait_seconds / self._wait_samples if self._wait_samples > 0 else None
             effective_switch_cost = self._effective_switch_cost()

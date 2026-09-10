@@ -20,6 +20,7 @@ the engine is lent to generation at the weight sync and reclaimed once the repla
 enough, with the remaining mini-batches served by the standalone pool alone.
 """
 
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -113,6 +114,13 @@ def _trainer(
     trainer.next_step_profile = False
     trainer.timing_raw = {}
     trainer.current_mode = HybridEngineMode.ROLLOUT
+    trainer._parallel_validation_executor = None
+    trainer._parallel_validation_future = None
+    trainer._parallel_validation_step = None
+    trainer._parallel_validation_start_time = None
+    trainer._replay_buffer_lock = threading.Lock()
+    trainer._parallel_validation_started_event = threading.Event()
+    trainer._parallel_validation_started_event.set()
     trainer.replay_buffer = _RecordingReplayBuffer(eviction_metrics, sampleable_count)
     trainer.events: list[str] = []
     trainer.checkpoint_manager = _RecordingCheckpointManager("hybrid", trainer.events)
@@ -182,6 +190,13 @@ def _construct_trainer(monkeypatch, *, replay_buffer, enable_switch: bool = True
     def mock_base_init(trainer, trainer_config):
         trainer.config = trainer_config
         trainer.replay_buffer = replay_buffer
+        trainer._parallel_validation_executor = None
+        trainer._parallel_validation_future = None
+        trainer._parallel_validation_step = None
+        trainer._parallel_validation_start_time = None
+        trainer._replay_buffer_lock = threading.Lock()
+        trainer._parallel_validation_started_event = threading.Event()
+        trainer._parallel_validation_started_event.set()
 
     monkeypatch.setattr(trainer_module.PPOTrainer, "__init__", mock_base_init)
     return PPOTrainerSeparateAsync(config)

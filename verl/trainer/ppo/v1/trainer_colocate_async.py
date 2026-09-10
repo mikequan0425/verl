@@ -46,6 +46,8 @@ class PPOTrainerColocateAsync(PPOTrainer):
         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
 
     def on_step_end(self):
+        # The next weight update must not see validation requests from the previous step.
+        self._wait_parallel_validation()
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
@@ -53,6 +55,8 @@ class PPOTrainerColocateAsync(PPOTrainer):
             self.checkpoint_manager.resume_generation_replicas()
 
     def on_sample_end(self):
+        # Abort would discard in-flight validation requests, so drain validation first.
+        self._wait_parallel_validation()
         # abort all unfinished requests and pause generation
         self.checkpoint_manager.abort_replicas()
         # sleep all replicas to discard weights and kv cache

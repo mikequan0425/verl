@@ -1018,8 +1018,14 @@ trainer:
     sync: {}
     colocate_async:
       num_warmup_batches: 1
+
+      # Whether validation may overlap the next step's rollout phase
+      parallel_validate_and_rollout: false
     separate_async:
       num_warmup_batches: 1
+
+      # Whether validation may overlap the next step's rollout phase
+      parallel_validate_and_rollout: false
       parameter_sync_step: 4
       hybrid_rollout:
         _target_: verl.trainer.config.HybridRolloutSwitchConfig

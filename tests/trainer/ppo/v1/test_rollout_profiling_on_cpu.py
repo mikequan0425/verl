@@ -14,6 +14,7 @@
 
 """Tests for the rollout profiler lifecycle across V1 trainer modes."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -45,6 +46,13 @@ def _trainer(cls, **managers):
     trainer.curr_step_profile = True
     trainer.next_step_profile = False
     trainer.local_trigger_step = 0
+    trainer._parallel_validation_executor = None
+    trainer._parallel_validation_future = None
+    trainer._parallel_validation_step = None
+    trainer._parallel_validation_start_time = None
+    trainer._replay_buffer_lock = threading.Lock()
+    trainer._parallel_validation_started_event = threading.Event()
+    trainer._parallel_validation_started_event.set()
     trainer.use_reference_policy = False
     trainer.use_critic = False
     trainer.actor_rollout_wg = MagicMock()

@@ -16,6 +16,8 @@ import json
 import logging
 import math
 import os
+import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -140,6 +142,14 @@ class PPOTrainer(ABC):
         )
         # track mini-batch index within a parameter_sync_step cycle for Decoupled PPO
         self.local_trigger_step = 0
+
+        self._parallel_validation_executor: ThreadPoolExecutor | None = None
+        self._parallel_validation_future = None
+        self._parallel_validation_step: int | None = None
+        self._parallel_validation_start_time: float | None = None
+        self._replay_buffer_lock = threading.Lock()
+        self._parallel_validation_started_event = threading.Event()
+        self._parallel_validation_started_event.set()
 
     def _build_replay_buffer(self) -> ReplayBuffer:
         """Instantiate the replay buffer (or a user-provided custom sampler).
@@ -469,13 +479,20 @@ class PPOTrainer(ABC):
             if self.config.trainer.test_freq > 0 and (
                 is_last_step or self.global_steps % self.config.trainer.test_freq == 0
             ):
-                with marked_timer("testing", self.timing_raw, color="green"):
-                    self.on_validate_begin()
-                    val_metrics: dict = self._validate()
-                    self.on_validate_end()
-                    if is_last_step:
-                        last_val_metrics = val_metrics
-                metrics.update(val_metrics)
+                if self._parallel_validate_and_rollout_enabled() and not is_last_step:
+                    # Let validation overlap the next step's rollout. Mode-specific hooks drain it
+                    # before rollout resources are reclaimed or weights are updated again.
+                    with marked_timer("testing", self.timing_raw, color="green"):
+                        self.on_validate_begin()
+                        self._start_parallel_validation()
+                else:
+                    with marked_timer("testing", self.timing_raw, color="green"):
+                        self.on_validate_begin()
+                        val_metrics: dict = self._validate()
+                        self.on_validate_end()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
 
             # 5. record metrics
             self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
@@ -499,12 +516,16 @@ class PPOTrainer(ABC):
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
+                self._wait_parallel_validation()
+                self._shutdown_parallel_validation_executor()
                 self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
                 return
 
         self.on_train_end()
+        self._wait_parallel_validation()
+        self._shutdown_parallel_validation_executor()
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
 
@@ -542,11 +563,12 @@ class PPOTrainer(ABC):
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
-            batch, off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=sample_batch_size,
-            )
+            with self._replay_buffer_lock:
+                batch, off_policy_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=sample_batch_size,
+                )
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
@@ -610,6 +632,78 @@ class PPOTrainer(ABC):
     def on_validate_end(self):
         """Called after the validation loop ends."""
         return
+
+    def _parallel_validate_and_rollout_enabled(self) -> bool:
+        """Whether validation may overlap the next step's rollout phase."""
+        if self.trainer_mode not in ("colocate_async", "separate_async"):
+            return False
+        return bool(self.config.trainer.v1[self.trainer_mode].get("parallel_validate_and_rollout", False))
+
+    def _has_pending_parallel_validation(self) -> bool:
+        return self._parallel_validation_future is not None
+
+    def _start_parallel_validation(self) -> None:
+        """Start validation in a driver thread while the training loop continues."""
+        if self._parallel_validation_future is not None:
+            raise RuntimeError("A parallel validation task is already running")
+
+        # A colocated reward model reclaims rollout replicas inside _validate. That would
+        # invalidate the overlap and race with the next training step.
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            raise ValueError(
+                "parallel_validate_and_rollout=True requires a streaming reward path (rule-based reward or "
+                "reward.reward_model.enable_resource_pool=True); a colocated reward model would reclaim "
+                "rollout resources during validation"
+            )
+
+        if self._parallel_validation_executor is None:
+            self._parallel_validation_executor = ThreadPoolExecutor(max_workers=1)
+        validation_step = self.global_steps
+        self._parallel_validation_start_time = time.perf_counter()
+        self._parallel_validation_step = validation_step
+        self._parallel_validation_started_event.clear()
+        self._parallel_validation_future = self._parallel_validation_executor.submit(
+            self._validate, global_steps=validation_step
+        )
+        # Do not let the main thread reclaim rollout replicas before the validation
+        # thread owns the replay-buffer lock.
+        while not self._parallel_validation_started_event.wait(timeout=0.1):
+            if self._parallel_validation_future.done():
+                # Surface an early failure instead of waiting forever.
+                self._parallel_validation_future.result()
+        logger.info("Started parallel validation for global step %s", validation_step)
+
+    def _wait_parallel_validation(self) -> dict | None:
+        """Drain validation before rollout resources are reclaimed or weights change."""
+        if self._parallel_validation_future is None:
+            return None
+
+        future = self._parallel_validation_future
+        validation_step = self._parallel_validation_step
+        start_time = self._parallel_validation_start_time
+        self._parallel_validation_future = None
+        self._parallel_validation_step = None
+        self._parallel_validation_start_time = None
+
+        try:
+            val_metrics = dict(future.result() or {})
+        except BaseException:
+            logger.exception("Parallel validation for global step %s failed", validation_step)
+            raise
+
+        if start_time is not None:
+            val_metrics["parallel_validation/elapsed_time"] = time.perf_counter() - start_time
+        if validation_step is not None:
+            self.logger.log(data=val_metrics, step=validation_step)
+        self.on_validate_end()
+        logger.info("Finished parallel validation for global step %s", validation_step)
+        return val_metrics
+
+    def _shutdown_parallel_validation_executor(self) -> None:
+        self._wait_parallel_validation()
+        if self._parallel_validation_executor is not None:
+            self._parallel_validation_executor.shutdown(wait=True)
+            self._parallel_validation_executor = None
 
     def on_step_begin(self):
         """Called at the beginning of each training step."""
@@ -970,7 +1064,14 @@ class PPOTrainer(ABC):
             trainer=self, global_step=self.global_steps, checkpoint_dir=local_global_step_folder, async_save=False
         )
 
-    def _validate(self) -> dict[str, float]:
+    def _validate(self, global_steps: int | None = None) -> dict[str, float]:
+        # ReplayBuffer rebuilds all partition metadata on every poll. Holding this lock
+        # for the whole validation prevents the driver thread from racing that rebuild.
+        with self._replay_buffer_lock:
+            return self._validate_impl(global_steps=global_steps)
+
+    def _validate_impl(self, global_steps: int | None = None) -> dict[str, float]:
+        validation_step = self.global_steps if global_steps is None else global_steps
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -984,6 +1085,7 @@ class PPOTrainer(ABC):
         dump_all_outputs: list[str] = []
         dump_all_keys: list[str] = []
         session_to_sample_idx: dict[str, int] = {}
+        submitted_validation_batch = False
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
@@ -991,19 +1093,24 @@ class PPOTrainer(ABC):
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
             batch = tu.get_tensordict(batch_dict)
-            tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(batch, "global_steps", validation_step)
             tu.assign_non_tensor_data(batch, "validate", True)
             # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker.
             # global_steps is required by ReplayBuffer's metadata sync / staleness ordering.
             tags = [
-                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
+                {"is_prompt": True, "status": "pending", "global_steps": validation_step} for _ in range(len(batch))
             ]
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
+            if not submitted_validation_batch:
+                # Unblock the driver only after the first validation batch is dispatched
+                # to the agent loop, preserving submission order under FCFS scheduling.
+                self._parallel_validation_started_event.set()
+                submitted_validation_batch = True
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
             batch, _ = self.replay_buffer.sample(
-                global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
+                global_steps=validation_step, partition_id="val", batch_size=len(batch)
             )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
@@ -1088,7 +1195,9 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
         # logger to wandb
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, global_steps=validation_step
+        )
 
         # dump to local dir
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1121,11 +1230,14 @@ class PPOTrainer(ABC):
                 }
                 | {"uid": dump_all_keys},
                 dump_path=val_data_dir,
+                global_steps=validation_step,
             )
 
+        if not submitted_validation_batch:
+            self._parallel_validation_started_event.set()
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, global_steps: int | None = None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
         generations_to_log = self.config.trainer.log_val_generations
         if generations_to_log == 0:
@@ -1143,7 +1255,8 @@ class PPOTrainer(ABC):
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        validation_step = self.global_steps if global_steps is None else global_steps
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, validation_step)
 
     @staticmethod
     def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
@@ -1182,9 +1295,11 @@ class PPOTrainer(ABC):
 
         print(f"Dumped generations to {filename}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps: int | None = None
+    ):
         """Dump rollout/validation samples as JSONL asynchronously."""
-        global_steps = self.global_steps
+        global_steps = self.global_steps if global_steps is None else global_steps
         future = self._dump_executor.submit(
             self._write_generations,
             inputs,
