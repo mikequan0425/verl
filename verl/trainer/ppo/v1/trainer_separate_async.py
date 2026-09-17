@@ -203,6 +203,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self.switch_to_rollout()
 
     def on_step_begin(self):
+        begin_spec_decode_counter_window(self)
         self._step_sample_wait_seconds = 0.0
         self._step_wait_samples = 0
         self._step_threshold = 0
@@ -289,9 +290,6 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         return sum(self._to_rollout_costs) / len(self._to_rollout_costs) + sum(self._to_trainer_costs) / len(
             self._to_trainer_costs
         )
-
-    def on_step_begin(self):
-        begin_spec_decode_counter_window(self)
 
     def on_step_end(self):
         end_spec_decode_counter_window(self)

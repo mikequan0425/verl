@@ -209,11 +209,15 @@ def _snapshot_spec_decode_counters(trainer) -> dict[str, float] | None:
 
 
 def begin_spec_decode_counter_window(trainer) -> None:
+    """Record the speculative decoding counters at the start of a metrics window."""
+
     trainer._spec_decode_counter_start = _snapshot_spec_decode_counters(trainer)
     trainer._spec_decode_counter_end = None
 
 
 def end_spec_decode_counter_window(trainer) -> None:
+    """Record the speculative decoding counters at the end of a metrics window."""
+
     trainer._spec_decode_counter_end = _snapshot_spec_decode_counters(trainer)
 
 
@@ -224,6 +228,23 @@ def compute_spec_decode_metrics_with_fallback(
     spec_verifies,
     non_padding_mask=None,
 ) -> dict[str, float]:
+    """Compute speculative decoding metrics, falling back to counter deltas.
+
+    Per-request statistics are preferred when available. Otherwise, metrics are
+    derived from the speculative decoding counter snapshots for the current
+    window.
+
+    Args:
+        trainer: Trainer containing the counter snapshots.
+        spec_drafts: Number of draft tokens for each request.
+        spec_accepts: Number of accepted draft tokens for each request.
+        spec_verifies: Number of verification steps for each request.
+        non_padding_mask: Optional mask selecting non-padding requests.
+
+    Returns:
+        The speculative decoding metrics, or an empty dictionary when neither
+        source contains valid statistics.
+    """
     metrics = compute_spec_decode_metrics(
         spec_drafts,
         spec_accepts,
